@@ -53,6 +53,15 @@ class FairseqSAMConfig(FairseqDataclass):
     gamma: float = field(
         default=0.5, metadata={"help": "epsilon for Adam optimizer"}
     )
+    rho_min: float = field(
+        default=0.01, metadata={"help": "minimum rho for SALP per-parameter adaptation"}
+    )
+    rho_max: float = field(
+        default=1.0, metadata={"help": "maximum rho for SALP per-parameter adaptation"}
+    )
+    rho_lr: float = field(
+        default=1.0, metadata={"help": "learning rate for rho update in SALP"}
+    )
     num_samples: int = field(
         default=32, metadata={"help": "epsilon for Adam optimizer"}
     )
@@ -139,6 +148,10 @@ class FairseqSAM(FairseqOptimizer):
                                 rho=args.rho,
                                 **kwargs)
             optimizer.init_mask()
+        elif args.sam_type == 'salp':
+            optimizer = SALP(params, model=model, base_optimizer=base_optimizer,
+                             rho=args.rho, rho_min=args.rho_min, rho_max=args.rho_max, rho_lr=args.rho_lr,
+                             **kwargs)
         elif args.sam_type == 'gsam':
             scheduler = CosineScheduler(T_max=args.max_updates_gsam, max_value=kwargs["lr"], min_value=0.0, optimizer=base_optimizer, warmup_steps=args.warmup_updates_gsam)
             rho_scheduler = ProportionScheduler(pytorch_lr_scheduler=scheduler, max_lr=kwargs["lr"], min_lr=0.0,
@@ -624,6 +637,88 @@ def enable_running_stats(model):
             module.momentum = module.backup_momentum
 
     model.apply(_enable)
+
+class SALP(SAM):
+    def __init__(self, params, base_optimizer, model, rho=0.05, rho_min=0.01, rho_max=1.0, rho_lr=1.0, **kwargs):
+        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+        self.model = model.cuda() if model is not None else None
+        super(SALP, self).__init__(params=params, base_optimizer=base_optimizer, rho=rho, **kwargs)
+        self.rho_lr = rho_lr
+        self.rho_min = rho_min
+        self.rho_max = rho_max
+        self.g_0_norm = torch.tensor(0.0, device=self.param_groups[0]["params"][0].device)
+        self.g_1_loss = 0.0
+        # initialize per-parameter rho tensors
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.requires_grad:
+                    self.state[p]['rho'] = torch.full_like(p, fill_value=rho)
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        # compute norm of current gradients
+        self.g_0_norm = self._grad_norm()
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None: continue
+                # element-wise rho for SALP
+                e_w = p.grad * (self.state[p]["rho"] / (self.g_0_norm + 1e-12)).to(p)
+                self.state[p]['g_0'] = p.grad.detach().clone()
+                self.state[p]['old_p'] = p.data.clone()
+                p.add_(e_w)
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        # restore original weights and update rho using current gradient and stored g0
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None: continue
+                p.data = self.state[p]['old_p']
+                self.update_rho(p)
+        # apply base optimizer step
+        self.base_optimizer.step()
+        if zero_grad:
+            self.zero_grad()
+
+    def update_rho(self, p):
+        g_1 = p.grad.data
+        g_0 = self.state[p]['g_0']
+        h_0 = g_1 - g_0
+        rho = self.state[p]['rho']
+        # scalar g0 norm with small epsilon
+        g0_norm = (self.g_0_norm + 1e-12)
+        # update rule
+        rho_g = (g_1 * g_0 / (g0_norm ** 2) - h_0 * g_0 * float(self.g_1_loss) / (g0_norm ** 3))
+        rho.add_(rho_g, alpha=self.rho_lr)
+        rho.clamp_(self.rho_min, self.rho_max)
+
+    def step(self, closure=None, loss_before=None, input_samples=None):
+        assert closure is not None, "SALP requires a closure"
+        closure = torch.enable_grad()(closure)
+        # enable BN running stats for clean forward
+        if self.model is not None:
+            enable_running_stats(self.model)
+        # original forward/backward
+        if loss_before is not None:
+            loss = loss_before.detach()
+        else:
+            loss, sample_size, logging_output = closure()
+            loss = loss.detach()
+        # first perturbation step
+        self.first_step(zero_grad=True)
+        # disable BN stats for perturbed forward
+        if self.model is not None:
+            disable_running_stats(self.model)
+        # get gradient at perturbed point and record perturbed loss
+        loss_perturbed, _, _ = closure()
+        self.g_1_loss = float(loss_perturbed.detach().item())
+        # perform second step: restore weights, update rho, optimizer step
+        self.second_step(zero_grad=True)
+        # re-enable BN running stats
+        if self.model is not None:
+            enable_running_stats(self.model)
 
 class GSAM(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer,model, gsam_alpha=0.4, rho_scheduler=None, adaptive=False, perturb_eps=1e-12, grad_reduce='mean', **kwargs):
